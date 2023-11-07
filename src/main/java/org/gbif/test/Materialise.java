@@ -20,21 +20,28 @@ import org.apache.spark.sql.types.*;
 
 import lombok.Builder;
 
+import static org.apache.spark.sql.functions.*;
+
 @Builder(toBuilder = true)
 public class Materialise implements Serializable {
   private final String source;
   private final String target;
 
-  public static void main(String[] args) {
-    Materialise.builder().source("/tmp/tree.csv").target("/tmp/tree-materialised").build().run();
+  public static void main(String[] args) throws InterruptedException {
+    Materialise.builder()
+        .source("/tmp/tree_sample.csv")
+        .target("/tmp/tree-materialised")
+        .build()
+        .run();
   }
 
-  public void run() {
+  public void run() throws InterruptedException {
     SparkSession spark =
         SparkSession.builder().appName("Materialise path").enableHiveSupport().getOrCreate();
 
     spark.sql("use tim");
     spark.sparkContext().conf().set("hive.exec.compress.output", "true");
+    AppendArray.register("array_append", spark);
 
     // Read input file adding an empty lineage column
     Dataset<Row> input =
@@ -50,15 +57,18 @@ public class Materialise implements Serializable {
                       DataTypes.createStructField("name", DataTypes.StringType, false)
                     }))
             .csv(source)
-            .withColumn("lineage", functions.lit(null).cast("string"));
+            .withColumn(
+                "path", functions.lit(null).cast(DataTypes.createArrayType(DataTypes.StringType)));
 
     spark.sql("DROP TABLE IF EXISTS tree_0");
     input.write().format("parquet").saveAsTable("tree_0");
 
-    // Loop doing a self join and copying down the parent lineage each time rewriting the full table
+    // Loop with a self join, copying down the parent lineage each time and rewriting the full table
     // into a new table. With sufficient looping, the lineage propagates to the leaf nodes
     Dataset<Row> df = null;
-    for (int i = 0; i < 30; i++) {
+    int maxSize = Integer.MAX_VALUE;
+    int loop = 0;
+    while (loop <= maxSize) {
       df =
           spark.sql(
               String.format(
@@ -67,15 +77,26 @@ public class Materialise implements Serializable {
                       + "  c.parentID AS parentID, "
                       + "  c.rank AS rank, "
                       + "  c.name AS name, "
-                      + "  concat_ws('|', p.lineage, c.parentID) AS lineage "
+                      + "  array_append(p.path, c.parentID) AS path "
                       + "FROM "
                       + "  tree_%d c LEFT JOIN tree_%d p ON c.parentID = p.id ",
-                  i, i));
+                  loop, loop));
 
-      spark.sql("DROP TABLE IF EXISTS tree_" + (i + 1));
-      df.write().format("parquet").saveAsTable("tree_" + (i + 1));
+      spark.sql("DROP TABLE IF EXISTS tree_" + (loop + 1));
+      df.write().format("parquet").saveAsTable("tree_" + (loop + 1));
+
+      // when we no longer grow the path, we're done
+      Dataset<Row> sizeDF = spark.sql("SELECT max(size(path)) AS maxPath FROM tree_" + (loop + 1));
+      maxSize = sizeDF.first().getInt(0);
+
+      loop++;
     }
-    df.repartition(10);
-    df.write().csv(target);
+
+    // flatten array and write CSV
+    df.createOrReplaceTempView("output");
+    Dataset<Row> csv =
+        spark.sql("SELECT id, parentId, rank, name, concat_ws('|', path) AS path FROM output");
+    csv.repartition(10);
+    csv.write().csv(target);
   }
 }
