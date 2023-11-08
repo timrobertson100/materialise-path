@@ -28,11 +28,7 @@ public class Materialise implements Serializable {
   private final String target;
 
   public static void main(String[] args) throws InterruptedException {
-    Materialise.builder()
-        .source("/tmp/tree_sample.csv")
-        .target("/tmp/tree-materialised")
-        .build()
-        .run();
+    Materialise.builder().source("/tmp/tree.csv").target("/tmp/tree-materialised").build().run();
   }
 
   public void run() throws InterruptedException {
@@ -58,18 +54,19 @@ public class Materialise implements Serializable {
                     }))
             .csv(source)
             .withColumn(
-                "path", functions.lit(null).cast(DataTypes.createArrayType(DataTypes.StringType)));
+                "path", functions.lit(null).cast(DataTypes.createArrayType(DataTypes.StringType)))
+            .filter(not(col("id").startsWith("201891")));
 
     spark.sql("DROP TABLE IF EXISTS tree_0");
     input.write().format("parquet").saveAsTable("tree_0");
 
+    // A breadth first traversal of the tree follows.
     // Loop with a self join, copying down the parent lineage each time and rewriting the full table
-    // into a new table. With sufficient looping, the lineage propagates to the leaf nodes
-    Dataset<Row> df = null;
+    // into a new table. With sufficient looping, the lineage propagates to the leaf nodes.
     int maxSize = Integer.MAX_VALUE;
     int loop = 0;
     while (loop <= maxSize) {
-      df =
+      Dataset<Row> df =
           spark.sql(
               String.format(
                   "SELECT "
@@ -82,6 +79,7 @@ public class Materialise implements Serializable {
                       + "  tree_%d c LEFT JOIN tree_%d p ON c.parentID = p.id ",
                   loop, loop));
 
+      // For robustness in Spark, write output in tables
       spark.sql("DROP TABLE IF EXISTS tree_" + (loop + 1));
       df.write().format("parquet").saveAsTable("tree_" + (loop + 1));
 
@@ -93,9 +91,9 @@ public class Materialise implements Serializable {
     }
 
     // flatten array and write CSV
-    df.createOrReplaceTempView("output");
     Dataset<Row> csv =
-        spark.sql("SELECT id, parentId, rank, name, concat_ws('|', path) AS path FROM output");
+        spark.sql(
+            "SELECT id, parentId, rank, name, concat_ws('|', path) AS path FROM tree_" + loop);
     csv.repartition(10);
     csv.write().csv(target);
   }
